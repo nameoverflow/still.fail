@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { zstdCompressSync } from "node:zlib";
 import { test } from "node:test";
 import { readTimeline, transcriptPaths } from "../src/read/transcript.ts";
 import { linkAgentHome, linkTranscripts, writeBuiltinSkills } from "../src/sessions/agent-home.ts";
@@ -150,6 +151,14 @@ test("a transcript's usage says its context now and what its calls would cost", 
   // Opus 5.5: $4 in, $20 out, $0.2 read; written 1.25× (5 minutes) or 2× (an hour).
   const cost = (10 * 4 + 1000 * 5 + 100 * 20) + (20 * 4 + 1000 * 0.2 + 200 * 8 + 50 * 20) + (5 * 4 + 10 * 20);
   assert.ok(Math.abs(tail.usage.cost - cost / 1e6) < 1e-12, `${tail.usage.cost}`);
+  // A subagent's transcript of its own (Claude Code's <id>/subagents/), put away or not: its calls cost too.
+  mkdirSync(join(dir, "c", "subagents"), { recursive: true });
+  writeFileSync(join(dir, "c", "subagents", "agent-a.jsonl"), call("s1", { input_tokens: 100, output_tokens: 10 }));
+  writeFileSync(join(dir, "c", "subagents", "agent-b.jsonl.zst"), zstdCompressSync(call("s2", { input_tokens: 100, output_tokens: 10 })));
+  appendFileSync(claude, call("m4", { input_tokens: 7, cache_read_input_tokens: 1300, output_tokens: 1 }));
+  tail.read();
+  assert.deepEqual([tail.usage.modelCalls, tail.usage.contextTokens], [6, 1307]);
+  assert.ok(Math.abs(tail.usage.cost - (cost + 7 * 4 + 1300 * 0.2 + 20 + 2 * (100 * 4 + 10 * 20)) / 1e6) < 1e-12, `${tail.usage.cost}`);
   const codex = join(dir, "x.jsonl");
   const count = (total: number, input: number) => `${JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { total_tokens: total }, last_token_usage: { input_tokens: input, cached_input_tokens: 1000, output_tokens: 10 }, model_context_window: 258000 } } })}\n`;
   writeFileSync(codex, `${JSON.stringify({ type: "turn_context", payload: { model: "gpt-6-sol" } })}\n` + count(2000, 1500) + count(2000, 1500) + count(5000, 3000));

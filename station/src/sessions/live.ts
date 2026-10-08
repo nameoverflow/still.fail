@@ -6,7 +6,8 @@
 // watches. Redesigned on one point (docs/station-ts.md, push not poll): a watched transcript is followed by the file
 // system's change events (fs.watch), not looked at every 250 ms.
 import type { Clock } from "effect";
-import { closeSync, existsSync, type FSWatcher, openSync, readFileSync, readSync, statSync, watch } from "node:fs";
+import { closeSync, existsSync, type FSWatcher, openSync, readdirSync, readFileSync, readSync, statSync, watch } from "node:fs";
+import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import type { LiveEvent } from "../agents/runtime.ts";
 import { Fibers } from "../ops/fibers.ts";
@@ -30,6 +31,20 @@ export type TranscriptUsage = {
 const noUsage = (): TranscriptUsage => ({
   modelCalls: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, model: null, contextTokens: 0, contextWindow: null, cost: 0, unpricedCalls: 0,
 });
+
+/// `from`'s calls added to `into`'s; the context and the model `from`'s if `context` (it was written to later).
+function addUp(into: TranscriptUsage, from: TranscriptUsage, context: boolean) {
+  into.modelCalls += from.modelCalls;
+  into.inputTokens += from.inputTokens;
+  into.cachedTokens += from.cachedTokens;
+  into.outputTokens += from.outputTokens;
+  into.cost += from.cost;
+  into.unpricedCalls += from.unpricedCalls;
+  if (context && from.modelCalls > 0) {
+    into.model = from.model ?? into.model;
+    [into.contextTokens, into.contextWindow] = [from.contextTokens, from.contextWindow];
+  }
+}
 
 export type LiveMessage =
   | { type: "steps"; steps: LiveStep[]; phase: { phase: Phase; elapsedMs: number } | null }
@@ -60,7 +75,12 @@ export class TranscriptTail {
   private packedStamp: string | null = null;
   private partial = Buffer.alloc(0);
   entries: TimelineEntry[] = [];
-  usage: TranscriptUsage = noUsage();
+  /// Its own calls' usage; `usage` adds its subagents'.
+  private own: TranscriptUsage = noUsage();
+  /// Claude Code's subagents, each written to a transcript of its own (`<id>/subagents/agent-*.jsonl`, counter.ts
+  /// `claudeFiles`): their calls are the session's too, read for their usage alone.
+  private subagents = new Map<string, TranscriptTail>();
+  private readonly usageOnly: boolean;
   /// Each Claude response counted, with the output counted of it and what a token of that costs (null: no price): one
   /// response is written as several lines, its output at its fullest on the last.
   private seen = new Map<string, { output: number; rate: number | null }>();
@@ -68,13 +88,46 @@ export class TranscriptTail {
   private totals = new Set<number>();
   private state: ReadState = { inner: new Map() };
 
-  constructor(runtime: "claude" | "codex", path: string) {
+  constructor(runtime: "claude" | "codex", path: string, usageOnly = false) {
     this.runtime = runtime;
     this.path = path;
+    this.usageOnly = usageOnly;
   }
 
-  /// New entries since the last read, with the index of the first.
+  /// What its calls and its subagents' used; the context is its own.
+  get usage(): TranscriptUsage {
+    if (this.subagents.size === 0) return this.own;
+    const usage = noUsage();
+    for (const sub of this.subagents.values()) addUp(usage, sub.usage, false);
+    addUp(usage, this.own, true);
+    return usage;
+  }
+
+  /// New entries since the last read, with the index of the first; its subagents' transcripts are read along.
   read(): [number, TimelineEntry[]] {
+    if (this.runtime === "claude" && !this.usageOnly) this.readSubagents();
+    return this.readOwn();
+  }
+
+  private readSubagents() {
+    const dir = join(this.path.replace(/\.jsonl$/, ""), "subagents");
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      // Put away (archive.ts) it is `.jsonl.zst`: read as the `.jsonl` it was.
+      const file = name.endsWith(".jsonl") ? name : name.endsWith(".jsonl.zst") ? name.slice(0, -4) : null;
+      if (file === null) continue;
+      let sub = this.subagents.get(file);
+      if (!sub) this.subagents.set(file, (sub = new TranscriptTail("claude", join(dir, file), true)));
+      sub.read();
+    }
+  }
+
+  private readOwn(): [number, TimelineEntry[]] {
     let start = this.entries.length;
     const compressed = !existsSync(this.path);
     const disk = compressed ? `${this.path}.zst` : this.path;
@@ -138,6 +191,7 @@ export class TranscriptTail {
       } catch {}
     }
     this.addUsage(records);
+    if (this.usageOnly) return [start, []];
     const entries: TimelineEntry[] = [];
     for (const r of records) timelineOf(this.runtime, r, this.state, entries);
     this.entries.push(...entries);
@@ -146,7 +200,7 @@ export class TranscriptTail {
 
   private addUsage(records: Json[]) {
     const n = (v: Json) => (typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : 0);
-    const usage = this.usage;
+    const usage = this.own;
     for (const r of records) {
       if (this.runtime === "claude") {
         const m = r?.type === "assistant" ? r.message : undefined;
@@ -234,17 +288,8 @@ export class ChainTail {
 
   get usage(): TranscriptUsage {
     const usage = noUsage();
-    for (const t of this.tails) {
-      usage.modelCalls += t.usage.modelCalls;
-      usage.inputTokens += t.usage.inputTokens;
-      usage.cachedTokens += t.usage.cachedTokens;
-      usage.outputTokens += t.usage.outputTokens;
-      usage.model = t.usage.model ?? usage.model;
-      usage.cost += t.usage.cost;
-      usage.unpricedCalls += t.usage.unpricedCalls;
-      // The context is the transcript's written to last that has called the model.
-      if (t.usage.modelCalls > 0) [usage.contextTokens, usage.contextWindow] = [t.usage.contextTokens, t.usage.contextWindow];
-    }
+    // The context is the transcript's written to last that has called the model.
+    for (const t of this.tails) addUp(usage, t.usage, true);
     return usage;
   }
 
